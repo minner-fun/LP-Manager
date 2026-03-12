@@ -1,6 +1,7 @@
 from sqlalchemy import (
     BigInteger,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -19,6 +20,23 @@ _N78 = Numeric(precision=78, scale=0)
 
 class Base(DeclarativeBase):
     pass
+
+
+# ---------------------------------------------------------------------------
+# 区块时间戳持久化缓存
+# ---------------------------------------------------------------------------
+
+class Block(Base):
+    """
+    区块时间戳的持久化缓存表。
+    每个区块只从链上查一次，后续采集直接走 DB，节省 RPC CU 消耗。
+    使用 (chain_id, block_number) 联合主键，为多链扩展预留空间。
+    """
+    __tablename__ = "blocks"
+
+    chain_id        = Column(Integer, nullable=False, default=1, primary_key=True)
+    block_number    = Column(BigInteger, nullable=False, primary_key=True)
+    block_timestamp = Column(DateTime, nullable=False)
 
 
 # ---------------------------------------------------------------------------
@@ -241,4 +259,138 @@ class SyncCursor(Base):
             "chain_id", "target_type", "target_address",
             name="uq_sync_cursors_target"
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 第三层：快照与聚合表（Data Engine 中间表）
+# ---------------------------------------------------------------------------
+
+_N38_18 = Numeric(precision=38, scale=18)   # 人类可读的价格 / USD 金额
+_N20_10 = Numeric(precision=20, scale=10)   # 比率 / 概率类指标
+
+
+class PoolPriceSnapshot(Base):
+    """
+    价格快照：每个区块取该块最后一笔 Swap（log_index 最大）的状态。
+    用途：OHLC 构建、波动率计算、TVL 估算。
+
+    price_token0：1 个 token0 能换多少 token1（人类可读，已调整 decimals）
+    price_token1：1 个 token1 能换多少 token0 = 1 / price_token0
+    例如 USDC/WETH 池：price_token0 ≈ 0.0003，price_token1 ≈ 3000
+    """
+    __tablename__ = "pool_price_snapshots"
+
+    id              = Column(BigInteger, primary_key=True, autoincrement=True)
+    pool_address    = Column(String(42), ForeignKey("pools.pool_address"), nullable=False)
+    chain_id        = Column(Integer, nullable=False, default=1)
+    block_number    = Column(BigInteger, nullable=False)
+    block_timestamp = Column(DateTime, nullable=False)
+
+    sqrt_price_x96  = Column(_N78, nullable=False)
+    tick            = Column(Integer, nullable=False)
+    liquidity       = Column(_N78, nullable=False)
+
+    price_token0    = Column(_N38_18)
+    price_token1    = Column(_N38_18)
+
+    created_at      = Column(DateTime, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("pool_address", "block_number", name="uq_snapshots_pool_block"),
+        Index("idx_snapshots_pool_time", "pool_address", "block_timestamp"),
+        Index("idx_snapshots_block_time", "block_timestamp"),
+    )
+
+
+class PoolMetricsHourly(Base):
+    """
+    小时聚合指标。
+
+    volume_usd / fee_usd 仅在稳定币配对池中填充
+    （由 data_engine 判断 token0/token1 哪侧是稳定币）。
+    fee_token0_raw / fee_token1_raw = volume_raw * fee_rate，近似值。
+    """
+    __tablename__ = "pool_metrics_hourly"
+
+    id              = Column(BigInteger, primary_key=True, autoincrement=True)
+    pool_address    = Column(String(42), ForeignKey("pools.pool_address"), nullable=False)
+    chain_id        = Column(Integer, nullable=False, default=1)
+    metric_hour     = Column(DateTime, nullable=False)
+
+    price_open      = Column(_N38_18)
+    price_close     = Column(_N38_18)
+    price_high      = Column(_N38_18)
+    price_low       = Column(_N38_18)
+
+    volume_token0_raw = Column(_N78, nullable=False, default=0)
+    volume_token1_raw = Column(_N78, nullable=False, default=0)
+    volume_usd        = Column(_N38_18)              # nullable：非稳定币对不填
+
+    swap_count      = Column(Integer, nullable=False, default=0)
+    mint_count      = Column(Integer, nullable=False, default=0)
+    burn_count      = Column(Integer, nullable=False, default=0)
+    collect_count   = Column(Integer, nullable=False, default=0)
+
+    fee_token0_raw  = Column(_N78)
+    fee_token1_raw  = Column(_N78)
+    fee_usd         = Column(_N38_18)                # nullable：非稳定币对不填
+
+    avg_liquidity   = Column(_N78)
+    close_liquidity = Column(_N78)
+
+    created_at      = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at      = Column(DateTime, nullable=False, server_default=func.now(),
+                             onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("pool_address", "metric_hour", name="uq_hourly_pool_hour"),
+        Index("idx_hourly_pool_time", "pool_address", "metric_hour"),
+    )
+
+
+class PoolMetricsDaily(Base):
+    """
+    日聚合指标，策略模块的主要数据源。
+
+    il_estimate_fullrange_1d：按全范围（V2 式）假设计算的 IL，
+        仅作参考，窄范围仓位的真实 IL 会更大。
+    tvl_estimate_usd：基于 mint/burn 累计净值估算，仅对稳定币对有效。
+    volatility_1d：当日 24 根小时 K 线收盘价的对数收益率标准差。
+    """
+    __tablename__ = "pool_metrics_daily"
+
+    id              = Column(BigInteger, primary_key=True, autoincrement=True)
+    pool_address    = Column(String(42), ForeignKey("pools.pool_address"), nullable=False)
+    chain_id        = Column(Integer, nullable=False, default=1)
+    metric_date     = Column(Date, nullable=False)
+
+    price_open      = Column(_N38_18)
+    price_close     = Column(_N38_18)
+    price_high      = Column(_N38_18)
+    price_low       = Column(_N38_18)
+
+    volume_token0_raw  = Column(_N78, nullable=False, default=0)
+    volume_token1_raw  = Column(_N78, nullable=False, default=0)
+    volume_usd         = Column(_N38_18)
+    fee_usd            = Column(_N38_18)
+    tvl_estimate_usd   = Column(_N38_18)
+
+    swap_count      = Column(Integer, nullable=False, default=0)
+    mint_count      = Column(Integer, nullable=False, default=0)
+    burn_count      = Column(Integer, nullable=False, default=0)
+    collect_count   = Column(Integer, nullable=False, default=0)
+
+    volatility_1d              = Column(_N20_10)
+    volume_tvl_ratio           = Column(_N20_10)
+    fee_apr                    = Column(_N20_10)
+    il_estimate_fullrange_1d   = Column(_N20_10)
+
+    created_at      = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at      = Column(DateTime, nullable=False, server_default=func.now(),
+                             onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("pool_address", "metric_date", name="uq_daily_pool_date"),
+        Index("idx_daily_pool_date", "pool_address", "metric_date"),
     )
