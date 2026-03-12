@@ -25,7 +25,10 @@ from typing import Optional
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from src.db.models import Block, Burn, Collect, Mint, Pool, Swap, SyncCursor, Token
+from src.db.models import (
+    Block, Burn, Collect, Mint, Pool, Swap, SyncCursor, Token,
+    PoolPriceSnapshot, PoolMetricsHourly, PoolMetricsDaily,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +325,108 @@ def update_sync_cursor(
         )
     )
     session.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# 聚合表通用 upsert 辅助
+# ---------------------------------------------------------------------------
+
+def _upsert_agg(session: Session, model, data: dict, constraint: str) -> None:
+    """
+    通用聚合表 upsert：冲突时更新除主键和 created_at 之外的所有字段。
+    供 price_snapshot / hourly / daily 三张表复用。
+    """
+    insert_stmt = pg_insert(model).values(**data)
+    skip = {"id", "created_at"}
+    update_cols = {
+        col.name: insert_stmt.excluded[col.name]
+        for col in model.__table__.columns
+        if col.name not in skip and col.name in data
+    }
+    stmt = insert_stmt.on_conflict_do_update(
+        constraint=constraint,
+        set_=update_cols,
+    )
+    session.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# PoolPriceSnapshot
+# ---------------------------------------------------------------------------
+
+def bulk_upsert_price_snapshots(session: Session, data_list: list[dict]) -> int:
+    """批量写入价格快照，冲突（相同 pool + block）时更新价格字段。"""
+    if not data_list:
+        return 0
+    insert_stmt = pg_insert(PoolPriceSnapshot).values(data_list)
+    update_cols = {
+        col.name: insert_stmt.excluded[col.name]
+        for col in PoolPriceSnapshot.__table__.columns
+        if col.name not in {"id", "created_at", "pool_address", "chain_id", "block_number"}
+    }
+    stmt = insert_stmt.on_conflict_do_update(
+        constraint="uq_snapshots_pool_block",
+        set_=update_cols,
+    )
+    result = session.execute(stmt)
+    return result.rowcount
+
+
+def get_last_snapshot_block(
+    session: Session, pool_address: str, chain_id: int = 1
+) -> Optional[int]:
+    """获取该 pool 已有快照的最大区块号，用于增量构建。"""
+    from sqlalchemy import select, func as sa_func
+    result = session.execute(
+        select(sa_func.max(PoolPriceSnapshot.block_number)).where(
+            PoolPriceSnapshot.pool_address == pool_address,
+            PoolPriceSnapshot.chain_id == chain_id,
+        )
+    ).scalar()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PoolMetricsHourly
+# ---------------------------------------------------------------------------
+
+def upsert_hourly_metrics(session: Session, data: dict) -> None:
+    """写入或更新小时指标（冲突键：pool_address + metric_hour）。"""
+    _upsert_agg(session, PoolMetricsHourly, data, "uq_hourly_pool_hour")
+
+
+def get_last_hourly_metric_time(
+    session: Session, pool_address: str, chain_id: int = 1
+) -> Optional[datetime]:
+    """获取该 pool 已有小时指标的最大 metric_hour，用于增量构建。"""
+    from sqlalchemy import select, func as sa_func
+    result = session.execute(
+        select(sa_func.max(PoolMetricsHourly.metric_hour)).where(
+            PoolMetricsHourly.pool_address == pool_address,
+            PoolMetricsHourly.chain_id == chain_id,
+        )
+    ).scalar()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PoolMetricsDaily
+# ---------------------------------------------------------------------------
+
+def upsert_daily_metrics(session: Session, data: dict) -> None:
+    """写入或更新日指标（冲突键：pool_address + metric_date）。"""
+    _upsert_agg(session, PoolMetricsDaily, data, "uq_daily_pool_date")
+
+
+def get_last_daily_metric_date(
+    session: Session, pool_address: str, chain_id: int = 1
+) -> Optional[datetime]:
+    """获取该 pool 已有日指标的最大 metric_date，用于增量构建。"""
+    from sqlalchemy import select, func as sa_func
+    result = session.execute(
+        select(sa_func.max(PoolMetricsDaily.metric_date)).where(
+            PoolMetricsDaily.pool_address == pool_address,
+            PoolMetricsDaily.chain_id == chain_id,
+        )
+    ).scalar()
+    return result
