@@ -11,7 +11,9 @@ MAINNET_RPC_URL = os.environ["MAINNET_RPC_URL"]
 UNISWAP_V3_FACTORY_ADDRESS = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 # pool create block FROM_BLOCK = 12376729，，start 21500000
 UNISWAP_V3_USDC_ETH_POOL_ADDRESS = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
-
+UNISWAP_V3_ETH_USDT_POOL_ADDRESS = "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"
+UNISWAP_V3_WBTC_USDC_POOL_ADDRESS = "0x99ac8cA7087fA4A2A1FB6357269965A2014ABc35"
+# from_block=24334542, to_block=24637017
 # 仅含 symbol / name / decimals 三个只读函数，足够采集 token 基础信息。
 # 注意：极少数老旧 token（如早期 MKR）把 symbol/name 定义为 bytes32 而非 string，
 # 调用时会 revert，crawl_factory.py 里已用 try/except 兜底。

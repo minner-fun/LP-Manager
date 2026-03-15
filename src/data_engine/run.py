@@ -10,7 +10,7 @@ with get_session() as session:
     # 1. 构建价格快照（每块最后一笔 Swap）
     price_snapshot.build_price_snapshots(
         session, pool_address, decimals0=6, decimals1=18,
-        from_block=24554542, to_block=24637017
+        from_block=24334542, to_block=24637017
     )
 
     # 2. 聚合小时指标（依赖 swaps + price_snapshots）
@@ -18,7 +18,7 @@ with get_session() as session:
         session, pool_address, fee=500,
         symbol0="USDC", symbol1="WETH",
         decimals0=6, decimals1=18,
-        from_time=datetime(2026, 3, 1), to_time=datetime(2026, 3, 12)
+        from_time=datetime(2026, 1, 28), to_time=datetime(2026, 3, 12)
     )
 
     # 3. 聚合日指标（依赖 hourly_metrics）
@@ -26,5 +26,5 @@ with get_session() as session:
         session, pool_address, fee=500,
         symbol0="USDC", symbol1="WETH",
         decimals0=6, decimals1=18,
-        from_date=date(2026, 3, 1), to_date=date(2026, 3, 12)
+        from_date=date(2026, 1, 28), to_date=date(2026, 3, 12)
     )

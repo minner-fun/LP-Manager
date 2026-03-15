@@ -15,13 +15,15 @@ from src.Constracts import (
     MAINNET_RPC_URL,
     POOLS_ABI,
     UNISWAP_V3_USDC_ETH_POOL_ADDRESS,
+    UNISWAP_V3_ETH_USDT_POOL_ADDRESS,
+    UNISWAP_V3_WBTC_USDC_POOL_ADDRESS,
 )
 from src.db import repository as repo
 from src.db.database import get_session, init_db
 
 # ── 扫描配置 ──────────────────────────────────────────────────────────────────
 CHAIN_ID   = 1
-FROM_BLOCK = 24554542   # 起始区块（Uniswap V3 部署区块）
+FROM_BLOCK = 24334542   # 起始区块（Uniswap V3 部署区块）
 TO_BLOCK   = 24637017   # 结束区块（示例：约扫描 100 万个区块）
 
 # 每处理 CHUNK_SIZE 个区块做一次小结：获取时间戳、写库、更新进度
@@ -30,8 +32,8 @@ TO_BLOCK   = 24637017   # 结束区块（示例：约扫描 100 万个区块）
 CHUNK_SIZE = 500
 
 ALCHEMY_FREE_MAX_RANGE = 10     # eth_getLogs 单次最多查的区块数
-REQUEST_INTERVAL       = 0.05    # eth_getLogs 批次间隔（秒）
-BLOCK_TS_INTERVAL      = 0.05    # eth_getBlockByNumber 间隔（秒）
+REQUEST_INTERVAL       = 0.03    # eth_getLogs 批次间隔（秒）
+BLOCK_TS_INTERVAL      = 0.03    # eth_getBlockByNumber 间隔（秒）
 RETRY_MAX              = 5
 RETRY_BASE_DELAY       = 2.0
 
@@ -50,7 +52,7 @@ except Exception as e:
     sys.exit(1)
 
 # ── 合约对象 & 事件 topic ─────────────────────────────────────────────────────
-pools_address = w3.to_checksum_address(UNISWAP_V3_USDC_ETH_POOL_ADDRESS)
+pools_address = w3.to_checksum_address(UNISWAP_V3_WBTC_USDC_POOL_ADDRESS)
 pool_contract = w3.eth.contract(address=pools_address, abi=json.loads(POOLS_ABI))
 
 POOL_MINT_TOPIC    = w3.keccak(text="Mint(address,address,int24,int24,uint128,uint256,uint256)").hex()
