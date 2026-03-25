@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from src.db import repository as repo
 from src.db.database import get_session
@@ -47,6 +47,9 @@ from src.strategy_engine.context import (
     build_context,
     get_active_position,
 )
+
+if TYPE_CHECKING:
+    from src.notification_engine.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +75,12 @@ class StrategyRunner:
         strategy:         BaseStrategy,
         position_manager: PositionManager,
         pool_config:      PoolConfig,
+        notifier:         Optional["TelegramNotifier"] = None,
     ) -> None:
-        self.strategy = strategy
-        self.pm       = position_manager
-        self.cfg      = pool_config
+        self.strategy  = strategy
+        self.pm        = position_manager
+        self.cfg       = pool_config
+        self.notifier  = notifier
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -126,17 +131,24 @@ class StrategyRunner:
 
         # ── ③ 执行 + 持久化（执行失败时仍记录信号）────────────────────────────
         exec_ok = True
+        exec_exc: Optional[Exception] = None
         with get_session() as session:
             try:
                 self._execute(session, ctx, position, decision)
             except Exception as exc:
-                exec_ok = False
+                exec_ok  = False
+                exec_exc = exc
                 logger.error("[runner] 链上执行失败：%s", exc, exc_info=True)
+                if self.notifier:
+                    self.notifier.notify_error(
+                        action    = decision.action.value,
+                        error_msg = str(exc),
+                    )
             finally:
                 self._save_signal(session, ctx, decision, exec_ok=exec_ok)
 
         if not exec_ok:
-            raise RuntimeError("链上执行失败，详见日志。")
+            raise RuntimeError("链上执行失败，详见日志。") from exec_exc
 
         logger.info("[runner] === run_once done ===")
         return decision
@@ -156,6 +168,12 @@ class StrategyRunner:
                 self.run_once()
             except Exception as exc:
                 logger.error("[runner] run_once 异常，下次循环继续：%s", exc)
+                # 循环级别的异常（如 DB 连接失败、上下文构建失败）也通知
+                if self.notifier:
+                    self.notifier.notify_error(
+                        action    = "run_loop",
+                        error_msg = str(exc),
+                    )
             logger.info("[runner] sleep %ds...", interval_secs)
             time.sleep(interval_secs)
 
@@ -176,13 +194,55 @@ class StrategyRunner:
             self._do_open(session, ctx, decision, action_type="OPEN")
 
         elif action == StrategyDecision.REBALANCE:
+            close_result = None
             if position is not None:
-                self._do_close_position(session, position, action_type="REBALANCE_CLOSE")
-            self._do_open(session, ctx, decision, action_type="REBALANCE_OPEN")
+                close_result = self._do_close_position(
+                    session, position, action_type="REBALANCE_CLOSE"
+                )
+            mint_result = self._do_open(
+                session, ctx, decision, action_type="REBALANCE_OPEN"
+            )
+            # 再平衡合并通知
+            if self.notifier and close_result and mint_result:
+                self.notifier.notify_rebalance(
+                    old_token_id    = position.token_id,
+                    new_token_id    = mint_result.token_id,
+                    old_tick_lower  = position.tick_lower,
+                    old_tick_upper  = position.tick_upper,
+                    new_tick_lower  = decision.tick_lower,
+                    new_tick_upper  = decision.tick_upper,
+                    collect_amount0 = close_result["collect"].amount0,
+                    collect_amount1 = close_result["collect"].amount1,
+                    new_amount0     = mint_result.amount0,
+                    new_amount1     = mint_result.amount1,
+                    burn_tx         = close_result["burn_tx"],
+                    mint_tx         = mint_result.tx_hash,
+                    reason          = decision.reason,
+                )
 
         elif action == StrategyDecision.CLOSE:
             if position is not None:
-                self._do_close_position(session, position, action_type="CLOSE")
+                close_result = self._do_close_position(
+                    session, position, action_type="CLOSE"
+                )
+                if self.notifier and close_result:
+                    self.notifier.notify_close(
+                        token_id        = position.token_id,
+                        tick_lower      = position.tick_lower,
+                        tick_upper      = position.tick_upper,
+                        collect_amount0 = close_result["collect"].amount0,
+                        collect_amount1 = close_result["collect"].amount1,
+                        burn_tx         = close_result["burn_tx"],
+                        reason          = decision.reason,
+                    )
+
+        elif action == StrategyDecision.HOLD:
+            if self.notifier:
+                vtv = ctx.avg_volume_tvl_ratio
+                self.notifier.notify_hold(
+                    reason  = decision.reason,
+                    avg_vtv = float(vtv) if vtv is not None else None,
+                )
 
         # HOLD：仅记录信号，无链上操作
 
@@ -192,7 +252,8 @@ class StrategyRunner:
         ctx: MarketContext,
         decision: Decision,
         action_type: str = "OPEN",
-    ) -> None:
+    ):
+        """执行 mint，持久化，返回 MintResult（供 REBALANCE 通知使用）。"""
         logger.info(
             "[runner] mint  tick=[%d, %d]  amount0=%d  amount1=%d",
             decision.tick_lower,
@@ -254,12 +315,28 @@ class StrategyRunner:
             },
         )
 
+        # OPEN 通知（REBALANCE 的合并通知由 _execute 负责）
+        if self.notifier and action_type == "OPEN":
+            self.notifier.notify_open(
+                token_id   = result.token_id,
+                tick_lower = decision.tick_lower,
+                tick_upper = decision.tick_upper,
+                amount0    = result.amount0,
+                amount1    = result.amount1,
+                liquidity  = result.liquidity,
+                tx_hash    = result.tx_hash,
+                reason     = decision.reason,
+            )
+
+        return result
+
     def _do_close_position(
         self,
         session,
         position: ActivePosition,
         action_type: str = "CLOSE",
-    ) -> None:
+    ) -> dict:
+        """执行 close_position，持久化，返回 close 结果 dict（供通知使用）。"""
         logger.info(
             "[runner] close_position  token_id=%d  action=%s",
             position.token_id,
@@ -287,6 +364,8 @@ class StrategyRunner:
                 },
             },
         )
+
+        return close
 
     # ------------------------------------------------------------------
     # 信号持久化
